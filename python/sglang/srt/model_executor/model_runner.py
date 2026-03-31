@@ -36,6 +36,10 @@ from torch import nn
 
 from sglang.jit_kernel.ngram_embedding import update_token_table_decode
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+import huggingface_hub
+
+from huggingface_hub import snapshot_download
+
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
@@ -183,8 +187,8 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_init_weights_send_group_for_remote_instance_request,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
+from sglang.srt.model_loader.weight_utils import default_weight_loader, get_lock
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
@@ -3691,7 +3695,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         from sglang.srt.model_loader.loader import RemoteModelLoader
 
         logger.info(f"Saving model to {url}")
-        RemoteModelLoader.save_model(self.model, self.model_config.model_path, url)
+        is_local = os.path.isdir(self.model_config.model_path)
+        if not is_local:
+             # Download the config files.
+            with get_lock(self.model_config.model_path, self.load_config.download_dir):
+                hf_folder = snapshot_download(
+                    self.model_config.model_path,
+                    revision=self.model_config.revision,
+                    allow_patterns="*.json",
+                    cache_dir=self.load_config.download_dir,
+                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                )
+        else:
+            hf_folder = self.model_config.model_path
+        RemoteModelLoader.save_model(self.model, hf_folder, url)
 
     def save_sharded_model(
         self, path: str, pattern: Optional[str] = None, max_size: Optional[int] = None
