@@ -13,7 +13,7 @@ from sglang.srt.connector.utils import pull_files_from_db
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
+DEFAULT_LOCAL_BUFFER_SIZE = 64 * 1024 * 1024  # 16 MB
 FILE_INDEX_KEY_PREFIX = "__index__"
 STANDALONE_CHUNK_SIZE = 8 * 1024 * 1024
 
@@ -184,24 +184,42 @@ class MooncakeStoreConnector(BaseKVConnector):
                 _copy_bytes_into_tensor(data, tensor)
             return
 
-        tensor_ptrs = [tensor.data_ptr() for tensor in tensors]
-        tensor_sizes = [tensor.untyped_storage().nbytes() for tensor in tensors]
+        # Ensure contiguous for correct RDMA transfer
+        contiguous_tensors = [
+            t.contiguous() if not t.is_contiguous() else t for t in tensors
+        ]
+        tensor_ptrs = [t.data_ptr() for t in contiguous_tensors]
+        tensor_sizes = [t.untyped_storage().nbytes() for t in contiguous_tensors]
 
-        for tensor in tensors:
-            ret_code = self.store.register_buffer(
-                tensor.data_ptr(), tensor.untyped_storage().nbytes()
-            )
-            if ret_code:
-                raise RuntimeError(
-                    f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
-                )
+        # Deduplicate register_buffer for tensors sharing the same storage
+        seen_ptrs = set()
+        for ptr, size in zip(tensor_ptrs, tensor_sizes):
+            if ptr not in seen_ptrs:
+                ret_code = self.store.register_buffer(ptr, size)
+                if ret_code:
+                    raise RuntimeError(
+                        f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
+                    )
+                seen_ptrs.add(ptr)
 
         results = self.store.batch_get_into(full_keys, tensor_ptrs, tensor_sizes)
         _check_batch_get_results(full_keys, results, tensor_sizes)
 
+        # Copy back to original tensors if they were non-contiguous
+        for orig, cont in zip(tensors, contiguous_tensors):
+            if orig is not cont:
+                orig.copy_(cont)
+
     def get_into(self, key: str, tensor: torch.Tensor) -> None:
-        tensor_size = tensor.untyped_storage().nbytes()
-        tensor_ptr = tensor.data_ptr()
+        # Ensure contiguous for correct RDMA transfer
+        if not tensor.is_contiguous():
+            cont_tensor = tensor.contiguous()
+            tensor_size = cont_tensor.untyped_storage().nbytes()
+            tensor_ptr = cont_tensor.data_ptr()
+        else:
+            tensor_size = tensor.untyped_storage().nbytes()
+            tensor_ptr = tensor.data_ptr()
+            cont_tensor = tensor
 
         ret_code = self.store.register_buffer(tensor_ptr, tensor_size)
         if ret_code:
@@ -212,6 +230,10 @@ class MooncakeStoreConnector(BaseKVConnector):
         self.store.batch_get_into(
             [f"{self.model_name}/{key}"], [tensor_ptr], [tensor_size]
         )
+
+        # Copy back if original was non-contiguous
+        if tensor is not cont_tensor:
+            tensor.copy_(cont_tensor)
 
     def get(self, key: str) -> Optional[torch.Tensor]:
         raise NotImplementedError("Use batch_get_into() instead for performance.")
@@ -270,17 +292,26 @@ class MooncakeStoreConnector(BaseKVConnector):
                 )
             return
 
-        tensor_ptrs = [tensor.data_ptr() for tensor in tensors]
-        tensor_sizes = [tensor.untyped_storage().nbytes() for tensor in tensors]
+        # Ensure all tensors are contiguous to avoid issues with views
+        # that share storage. Using untyped_storage().nbytes() on a view
+        # returns the full storage size, not the view's actual size,
+        # which causes incorrect RDMA registration and data corruption.
+        contiguous_tensors = [
+            t.contiguous() if not t.is_contiguous() else t for t in tensors
+        ]
+        tensor_ptrs = [t.data_ptr() for t in contiguous_tensors]
+        tensor_sizes = [t.untyped_storage().nbytes() for t in contiguous_tensors]
 
-        for tensor in tensors:
-            ret_code = self.store.register_buffer(
-                tensor.data_ptr(), tensor.untyped_storage().nbytes()
-            )
-            if ret_code:
-                raise RuntimeError(
-                    f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
-                )
+        # Deduplicate register_buffer for tensors sharing the same storage
+        seen_ptrs = set()
+        for ptr, size in zip(tensor_ptrs, tensor_sizes):
+            if ptr not in seen_ptrs:
+                ret_code = self.store.register_buffer(ptr, size)
+                if ret_code:
+                    raise RuntimeError(
+                        f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
+                    )
+                seen_ptrs.add(ptr)
 
         results = self.store.batch_put_from(
             keys, tensor_ptrs, tensor_sizes, self._rep_config
