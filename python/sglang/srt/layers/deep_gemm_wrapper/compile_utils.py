@@ -32,6 +32,7 @@ _DO_COMPILE_ALL = True
 _IS_FIRST_RANK_ON_NODE = envs.SGLANG_IS_FIRST_RANK_ON_NODE.get()
 _IN_PRECOMPILE_STAGE = envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get()
 _FAST_WARMUP = envs.SGLANG_JIT_DEEPGEMM_FAST_WARMUP.get()
+_PRELOAD_CACHE = envs.SGLANG_JIT_DEEPGEMM_PRELOAD_CACHE.get()
 
 # Force redirect deep_gemm cache_dir
 os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
@@ -107,6 +108,7 @@ class DeepGemmKernelType(IntEnum):
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
+_PRELOAD_CACHE_DONE = False
 
 
 # TODO improve code
@@ -118,8 +120,21 @@ def _maybe_compile_deep_gemm_one_type_all(
 ) -> None:
     global _INITIALIZATION_DICT
     global _BUILTIN_M_LIST
+    global _PRELOAD_CACHE_DONE
 
     query_key = (kernel_type, n, k, num_groups)
+
+    # Preload cache mode: load all pre-compiled cubins once globally
+    if _PRELOAD_CACHE and not _PRELOAD_CACHE_DONE and hasattr(deep_gemm, "preload_cache"):
+        loaded = deep_gemm.preload_cache()
+        logger.info(f"DeepGEMM preload_cache: loaded {loaded} kernels")
+        _PRELOAD_CACHE_DONE = True
+
+    # In preload mode, all cubins are already in memory cache.
+    # Subsequent build() calls will hit L1 cache directly.
+    if _PRELOAD_CACHE_DONE:
+        return
+
     if (
         _ENABLE_JIT_DEEPGEMM_PRECOMPILE
         and _DO_COMPILE_ALL
