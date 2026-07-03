@@ -23,8 +23,9 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
+from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
-from sglang.srt.utils import logger
+from sglang.srt.utils import is_remote_url, logger
 
 from .common import (
     AutoConfig,
@@ -153,6 +154,14 @@ def get_processor(
 
     revision = kwargs.pop("revision", tokenizer_revision)
     tokenizer_name = resolve_runai_obj_uri(tokenizer_name)
+
+    if is_remote_url(tokenizer_name):
+        # BaseConnector implements __del__() to clean up the local dir.
+        # Since config files need to exist all the time, so we DO NOT use
+        # with statement to avoid closing the client.
+        client = create_remote_connector(tokenizer_name)
+        client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
+        tokenizer_name = client.get_local_dir()
 
     if is_mistral_model(tokenizer_name):
         config = load_mistral_config(
